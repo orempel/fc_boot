@@ -78,140 +78,49 @@ static int uart_putchar(char c, FILE *stream)
 
 static FILE mystdout = FDEV_SETUP_STREAM(uart_putchar, NULL, _FDEV_SETUP_WRITE);
 
-static uint8_t i2c_cmd;
-static uint8_t i2c_dev;
-static uint16_t i2c_address;
-static uint8_t i2c_buf[64];
-static volatile uint8_t i2c_complete;
-
-void i2c_transfer(uint8_t cmd)
+static uint8_t i2c_master_tx(uint8_t val)
 {
-	i2c_complete = 0;
-	i2c_cmd = cmd;
-	TWCR |= (1<<TWINT) | (1<<TWSTA);
-
-	PORTB |= LED_RT;
-	while (i2c_complete != 1) {
-		if (i2c_complete == 2) {
-			_delay_ms(5);
-			TWCR |= (1<<TWINT) | (1<<TWSTA);
-		}
-	}
-	PORTB &= ~LED_RT;
-}
-
-ISR(TWI_vect)
-{
-	static uint8_t bcnt;
+	TWDR = val;
+	TWCR = (1<<TWINT) | (1<<TWEN);
+	loop_until_bit_is_set(TWCR, TWINT);
 
 	uint8_t status = TWSR & 0xF8;
-// 	printf("status: 0x%02x 0x%02x 0x%02x\n", i2c_cmd, status, bcnt);
+	return status;
+}
 
-	switch (status) {
-	/* START transmitted -> send SLA+W */
-	case 0x08:
-		bcnt = 0;
-		TWDR = (i2c_dev << 1);
-		TWCR &= ~(1<<TWSTA);
-		TWCR |= (1<<TWINT);
-		break;
+static uint8_t i2c_master_rx(uint8_t *val, uint8_t ack)
+{
+	if (ack)
+		TWCR = (1<<TWINT) | (1<<TWEN) | (1<<TWEA);
+	else
+		TWCR = (1<<TWINT) | (1<<TWEN);
 
-	/* repeated START transmitted -> send SLA+R */
-	case 0x10:
-		bcnt = 0;
-		TWDR = (i2c_dev << 1) | 0x01;
-		TWCR &= ~(1<<TWSTA);
-		TWCR |= (1<<TWINT);
-		break;
+	loop_until_bit_is_set(TWCR, TWINT);
+	*val = TWDR;
 
-	/* SLA+W transmitted, ACK received -> send command */
-	case 0x18:
-		bcnt++;
-		TWDR = i2c_cmd;
-		TWCR |= (1<<TWINT);
-		break;
+	uint8_t status = TWSR & 0xF8;
+	return status;
+}
 
-	/* data transmitted, ACK received -> ? */
-	case 0x28:
-		switch (i2c_cmd) {
-		case CMD_GET_INFO:
-		case CMD_GET_SIGNATURE:
-		case CMD_READ_FLASH:
-		case CMD_READ_EEPROM:
-			TWCR |= (1<<TWINT) | (1<<TWSTA);
+static void i2c_stop(void)
+{
+	PORTB &= ~LED_RT;
+	TWCR = (1<<TWINT) | (1<<TWSTO) | (1<<TWEN);
+}
+
+static void i2c_start_address(uint8_t addr)
+{
+	while (1) {
+		PORTB |= LED_RT;
+		TWCR = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN);
+		loop_until_bit_is_set(TWCR, TWINT);
+
+		uint8_t status = i2c_master_tx(addr);
+		if (status == 0x18 || status == 0x40)
 			break;
 
-		case CMD_WRITE_FLASH:
-		case CMD_WRITE_EEPROM:
-			if (bcnt == 1) {
-				TWDR = (i2c_address >> 8);
-
-			} else if (bcnt == 2) {
-				TWDR = (i2c_address & 0xFF);
-
-			} else if (bcnt == 3) {
-				TWDR = (WRITE_COOKIE >> 8);
-
-			} else if (bcnt == 4) {
-				TWDR = (WRITE_COOKIE & 0xFF);
-
-			} else if (bcnt >= 5 && bcnt < (64 +5)) {
-				TWDR = i2c_buf[bcnt -5];
-
-			} else {
-				i2c_complete = 1;
-				TWCR |= (1<<TWSTO);
-			}
-			TWCR |= (1<<TWINT);
-			break;
-
-		default:
-		case CMD_BOOT_APPLICATION:
-		case CMD_BOOT_LOADER:
-			i2c_complete = 1;
-			TWCR |= (1<<TWINT) | (1<<TWSTO);
-			break;
-		}
-		bcnt++;
-		break;
-
-	/* SLA+R transmitted, ACK received -> send ACK (send more data) */
-	case 0x40:
-		TWCR |= (1<<TWINT) | (1<<TWEA);
-		break;
-
-	/* data received, ACK sent */
-	case 0x50:
-		i2c_buf[bcnt++] = TWDR;
-
-		if ((i2c_cmd == CMD_GET_INFO && bcnt < 16) ||
-		    (i2c_cmd == CMD_GET_SIGNATURE && bcnt < 4) ||
-		    ((i2c_cmd == CMD_READ_FLASH || i2c_cmd == CMD_READ_EEPROM) && bcnt < 64)) {
-			TWCR |= (1<<TWEA);
-		} else {
-			TWCR &= ~(1<<TWEA);
-		}
-		TWCR |= (1<<TWINT);
-		break;
-
-	/* data received, NACK sent */
-	case 0x58:
-		i2c_buf[bcnt++] = TWDR;
-		i2c_complete = 1;
-		TWCR |= (1<<TWINT) | (1<<TWSTO);
-		break;
-
-	/* SLA+W transmitted, NACK received */
-	case 0x20:
-	/* data transmitted, NACK received */
-	case 0x30:
-	/* arbitation lost during SLA+W, SLA+R or data */
-	case 0x38:
-	/* SLA+R transmitted, NACK received */
-	default:
-		i2c_complete = 2;
-		TWCR |= (1<<TWINT) | (1<<TWSTO);
-		break;
+		i2c_stop();
+		_delay_ms(1);
 	}
 }
 
@@ -331,8 +240,15 @@ static uint16_t readEEpromPage(uint16_t address, uint16_t size)
 void cmd_loop(void)
 {
 	uint8_t dev = 0;
+	uint8_t i2c_dev = (0x21 << 1);
 
-	i2c_dev = 0x21;
+	sendchar('F');
+	sendchar('C');
+	sendchar('_');
+	sendchar('B');
+	sendchar('O');
+	sendchar('O');
+	sendchar('T');
 
 	while (1) {
 		uint8_t val = recvchar();
@@ -366,22 +282,24 @@ void cmd_loop(void)
 				*tmp++ = (cnt < size) ? recvchar() : 0xFF;
 
 			if (dev == DEVCODE_M8) {
-				if (val == 'F') {
-					tmp = page_buf;
-					while (size) {
-						i2c_address = address;
-						for (cnt = 0; cnt < sizeof(i2c_buf); cnt++)
-							i2c_buf[cnt] = *tmp++;
+				i2c_start_address(i2c_dev);
+				if (val == 'F')
+					i2c_master_tx(CMD_WRITE_FLASH);
+				else
+					i2c_master_tx(CMD_WRITE_EEPROM);
 
-						i2c_transfer(CMD_WRITE_FLASH);
-						address += sizeof(i2c_buf);
+				i2c_master_tx(address >> 8);
+				i2c_master_tx(address & 0xFF);
+				address += sizeof(page_buf);
 
-						size -= sizeof(i2c_buf);
-					}
+				i2c_master_tx(WRITE_COOKIE >> 8);
+				i2c_master_tx(WRITE_COOKIE & 0xFF);
 
-				} else if (val == 'E') {
+				tmp = page_buf;
+				for (cnt = 0; cnt < sizeof(page_buf); cnt++)
+					i2c_master_tx(*tmp++);
 
-				}
+				i2c_stop();
 
 			} else if (dev == DEVCODE_M644) {
 				if (val == 'F') {
@@ -399,21 +317,23 @@ void cmd_loop(void)
 			val = recvchar();
 
 			if (dev == DEVCODE_M8) {
-				if (val == 'F') {
-					while (size > 0) {
-						uint8_t i = 0;
-						i2c_address = address;
-						i2c_transfer(CMD_READ_FLASH);
+				i2c_start_address(i2c_dev);
+				if (val == 'F')
+					i2c_master_tx(CMD_READ_FLASH);
+				else
+					i2c_master_tx(CMD_READ_EEPROM);
 
-						address += sizeof(i2c_buf);
-						while (size-- && i < sizeof(i2c_buf))
-							sendchar(i2c_buf[i++]);
-					}
+				i2c_master_tx(address >> 8);
+				i2c_master_tx(address & 0xFF);
 
-				} else if (val == 'E') {
-					sendchar(0xff);
-
+				i2c_start_address(i2c_dev | 0x01);
+				while (size--) {
+					i2c_master_rx(&val, size > 0);
+					sendchar(val);
+					address++;
 				}
+
+				i2c_stop();
 
 			} else if (dev == DEVCODE_M644) {
 				if (val == 'F') {
@@ -437,14 +357,27 @@ void cmd_loop(void)
 
 		// Enter programming mode
 		} else if (val == 'P') {
-			/* boot loader */
-			i2c_transfer(CMD_BOOT_LOADER);
+			i2c_start_address(i2c_dev);
+			i2c_master_tx(CMD_BOOT_LOADER);
+			i2c_stop();
+
+			_delay_ms(10);
+
+			i2c_start_address(i2c_dev);
+			i2c_master_tx(CMD_GET_SIGNATURE);
+			i2c_start_address(i2c_dev | 0x01);
+			i2c_master_rx(&val, 1);
+			i2c_master_rx(&val, 1);
+			i2c_master_rx(&val, 0);
+			i2c_stop();
+
 			sendchar('\r');
 
 		// Leave programming mode
 		} else if (val == 'L') {
-			/* boot application */
-			i2c_transfer(CMD_BOOT_APPLICATION);
+			i2c_start_address(i2c_dev);
+			i2c_master_tx(CMD_BOOT_APPLICATION);
+			i2c_stop();
 			sendchar('\r');
 
 		// return programmer type
@@ -478,7 +411,7 @@ void cmd_loop(void)
 			sendchar('T');
 
 		// Return Software Version
-		} else if (val == 'V') {
+		} else if (val == 'V' || val == 'v') {
 			sendchar('0');
 			sendchar('8');
 
@@ -502,8 +435,22 @@ void cmd_loop(void)
 
 		// set i2c target
 		} else if (val >= '1' && val <= '4') {
-			i2c_dev = val - '1' + 0x21;
+			i2c_dev = (val - '1' + 0x21) << 1;
 			sendchar(val);
+
+		// test props
+		} else if (val == 'l') {
+			i2c_start_address(i2c_dev);
+			i2c_master_tx(CMD_SET_PWM);
+			i2c_master_tx(0x00);
+			i2c_stop();
+
+		// test props
+		} else if (val == 'k') {
+			i2c_start_address(i2c_dev);
+			i2c_master_tx(CMD_SET_PWM);
+			i2c_master_tx(0x0f);
+			i2c_stop();
 
 		/* ESC */
 		} else if (val != 0x1b) {
@@ -541,37 +488,21 @@ int main(void)
 
 	/* enable TWI interface */
 	TWBR = ((F_CPU/TWI_CLK)-16)/2;
-	TWCR = (1<<TWSTO) | (1<<TWEN) | (1<<TWIE);
+	TWCR = (1<<TWSTO) | (1<<TWEN);
 
 	sei();
 
 	while (boot_timeout > 0) {
 		if (UCSR0A & (1<<RXC0))
-			cmd_loop();
+			if (recvchar() == 'S')
+				cmd_loop();
 	}
 
 	cli();
 
-	/* disable TWI */
-	TWCR = 0x00;
-
-	/* disable Timer0 */
-	TIMSK0 = 0x00;
-	TCCR0B = 0x00;
-
-	/* disable USART */
-	UCSR0C = 0x00;
-	UCSR0B = 0x00;
-
 	/* move interrupt-vectors to applicaion */
 	MCUCR = (1<<IVCE);
 	MCUCR = (0<<IVSEL);
-
-	PORTB = 0x00;
-
-	uint8_t i;
-	for (i = 0; i < 10; i++)
-		_delay_ms(10);
 
 	jump_to_app();
 
