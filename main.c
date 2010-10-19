@@ -35,7 +35,7 @@
 #define LED_RT			(1<<PORTB0)
 #define LED_GN			(1<<PORTB1)
 
-#define TWI_CLK			200000
+#define TWI_CLK			100000
 
 #define WRITE_COOKIE		0x4711
 #define CMD_WAIT		0x00
@@ -239,8 +239,7 @@ static uint16_t readEEpromPage(uint16_t address, uint16_t size)
 
 void cmd_loop(void)
 {
-	uint8_t dev = 0;
-	uint8_t i2c_dev = (0x21 << 1);
+	uint8_t i2c_dev = 0;
 
 	sendchar('F');
 	sendchar('C');
@@ -281,12 +280,17 @@ void cmd_loop(void)
 			for (cnt = 0; cnt < sizeof(page_buf); cnt++)
 				*tmp++ = (cnt < size) ? recvchar() : 0xFF;
 
-			if (dev == DEVCODE_M8) {
+			if (i2c_dev != 0) {
 				i2c_start_address(i2c_dev);
-				if (val == 'F')
+				if (val == 'F') {
 					i2c_master_tx(CMD_WRITE_FLASH);
-				else
+					// FIXME: Flashwriting is not working. see bl_master (which works)
+
+				} else {
 					i2c_master_tx(CMD_WRITE_EEPROM);
+					/* no page align, transfer only needed bytes */
+					cnt = size;
+				}
 
 				i2c_master_tx(address >> 8);
 				i2c_master_tx(address & 0xFF);
@@ -296,12 +300,12 @@ void cmd_loop(void)
 				i2c_master_tx(WRITE_COOKIE & 0xFF);
 
 				tmp = page_buf;
-				for (cnt = 0; cnt < sizeof(page_buf); cnt++)
+				while (cnt--)
 					i2c_master_tx(*tmp++);
 
 				i2c_stop();
 
-			} else if (dev == DEVCODE_M644) {
+			} else {
 				if (val == 'F') {
 					address = writeFlashPage(address, size);
 				} else if (val == 'E') {
@@ -316,7 +320,7 @@ void cmd_loop(void)
 			size |= recvchar();
 			val = recvchar();
 
-			if (dev == DEVCODE_M8) {
+			if (i2c_dev != 0) {
 				i2c_start_address(i2c_dev);
 				if (val == 'F')
 					i2c_master_tx(CMD_READ_FLASH);
@@ -335,7 +339,7 @@ void cmd_loop(void)
 
 				i2c_stop();
 
-			} else if (dev == DEVCODE_M644) {
+			} else {
 				if (val == 'F') {
 					address = readFlashPage(address, size);
 				} else if (val == 'E') {
@@ -357,27 +361,30 @@ void cmd_loop(void)
 
 		// Enter programming mode
 		} else if (val == 'P') {
-			i2c_start_address(i2c_dev);
-			i2c_master_tx(CMD_BOOT_LOADER);
-			i2c_stop();
+			if (i2c_dev != 0) {
+				i2c_start_address(i2c_dev);
+				i2c_master_tx(CMD_BOOT_LOADER);
+				i2c_stop();
 
-			_delay_ms(10);
+				_delay_ms(10);
 
-			i2c_start_address(i2c_dev);
-			i2c_master_tx(CMD_GET_SIGNATURE);
-			i2c_start_address(i2c_dev | 0x01);
-			i2c_master_rx(&val, 1);
-			i2c_master_rx(&val, 1);
-			i2c_master_rx(&val, 0);
-			i2c_stop();
-
+				i2c_start_address(i2c_dev);
+				i2c_master_tx(CMD_GET_SIGNATURE);
+				i2c_start_address(i2c_dev | 0x01);
+				i2c_master_rx(&val, 1);
+				i2c_master_rx(&val, 1);
+				i2c_master_rx(&val, 0);
+				i2c_stop();
+			}
 			sendchar('\r');
 
 		// Leave programming mode
 		} else if (val == 'L') {
-			i2c_start_address(i2c_dev);
-			i2c_master_tx(CMD_BOOT_APPLICATION);
-			i2c_stop();
+			if (i2c_dev != 0) {
+				i2c_start_address(i2c_dev);
+				i2c_master_tx(CMD_BOOT_APPLICATION);
+				i2c_stop();
+			}
 			sendchar('\r');
 
 		// return programmer type
@@ -386,8 +393,7 @@ void cmd_loop(void)
 
 		// Return device type
 		} else if (val == 't') {
-			sendchar(DEVCODE_M8);
-			sendchar(DEVCODE_M644);
+			sendchar((i2c_dev == 0) ? DEVCODE_M644 : DEVCODE_M8);
 			sendchar(0);
 
 		// clear and set LED ignored
@@ -397,7 +403,7 @@ void cmd_loop(void)
 
 		// set device
 		} else if (val == 'T') {
-			dev = recvchar();
+			recvchar();
 			sendchar('\r');
 
 		// Return software identifier
@@ -417,23 +423,22 @@ void cmd_loop(void)
 
 		// Return Signature Bytes
 		} else if (val == 's') {
-			if (dev == DEVCODE_M8) {
+			if (i2c_dev != 0) {
 				sendchar(0x07);
 				sendchar(0x93);
 				sendchar(0x1e);
 
-			} else if (dev == DEVCODE_M644) {
+			} else {
 				sendchar(0x09);
 				sendchar(0x96);
 				sendchar(0x1e);
-
-			} else {
-				sendchar(0xFF);
-				sendchar(0xFF);
-				sendchar(0xFF);
 			}
 
 		// set i2c target
+		} else if (val == '0') {
+			i2c_dev = 0;
+			sendchar(val);
+
 		} else if (val >= '1' && val <= '4') {
 			i2c_dev = (val - '1' + 0x21) << 1;
 			sendchar(val);
@@ -450,6 +455,20 @@ void cmd_loop(void)
 			i2c_start_address(i2c_dev);
 			i2c_master_tx(CMD_SET_PWM);
 			i2c_master_tx(0x0f);
+			i2c_stop();
+
+		// get Info
+		} else if (val == 'I') {
+			i2c_start_address(i2c_dev);
+			i2c_master_tx(CMD_GET_INFO);
+			i2c_start_address(i2c_dev | 0x01);
+
+			uint8_t cnt;
+			for (cnt = 0; cnt < 16; cnt++) {
+				i2c_master_rx(&val, (cnt != 15));
+				sendchar(val);
+			}
+
 			i2c_stop();
 
 		/* ESC */
