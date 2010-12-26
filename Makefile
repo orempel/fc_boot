@@ -1,6 +1,6 @@
 PRG            = fc_boot
 OBJ            = main.o
-MCU_TARGET     = atmega644
+MCU_TARGET     = atmega644p
 OPTIMIZE       = -Os
 
 DEFS           =
@@ -22,7 +22,7 @@ $(PRG).elf: $(OBJ)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 clean:
-	rm -rf *.o *.lst *.map $(PRG).elf *.hex *.bin
+	rm -rf *.o $(PRG).lst $(PRG).map $(PRG).elf $(PRG).hex $(PRG).bin
 
 lst:  $(PRG).lst
 
@@ -41,5 +41,4 @@ bin:  $(PRG).bin
 	$(OBJCOPY) -j .text -j .data -O binary $< $@
 
 install: text
-#	uisp -dprog=avr910 -dserial=/dev/ttyS0 -dspeed=115200 -dpart=M8 --erase --upload if=$(PRG).hex
-	avrdude -p m644 -c butterfly -b 115200 -P /dev/ttyS0 -u -V -U flash:w:$(PRG).hex
+	avrdude -c dragon_isp -P usb -p m644p -B0.3 -V -U flash:w:$(PRG).hex

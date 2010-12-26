@@ -22,39 +22,50 @@
 #include <avr/pgmspace.h>
 #include <avr/wdt.h>
 
-#include <stdio.h>
+/*
+ * ATMega 644P:
+ * Fuse E: 0xFD (2.7V BOD)
+ * Fuse H: 0xDA (2048 words bootloader)
+ * Fuse L: 0xFF (ext. Crystal)
+ */
 
 #define F_CPU 20000000
 #include <util/delay.h>
 
-#define BAUDRATE 19200
+#define BAUDRATE 57600
 #define UART_CALC_BAUDRATE(baudRate) ((uint32_t)(F_CPU) / ((uint32_t)(baudRate)*16) -1)
 
-#define APP_END		0xF000
+#define APP_END			0xF000
 
-#define LED_RT			(1<<PORTB0)
-#define LED_GN			(1<<PORTB1)
+#define LED_RT			(1<<PORTB0)			/* low active */
+#define LED_GN			(1<<PORTB1)			/* high active */
 
 #define TWI_CLK			100000
+#define TWI_ADDRESS_BASE	0x20				/* 0x21 - 0x24 */
 
-#define WRITE_COOKIE		0x4711
+#define TWI_DEVCODE		0x77				/* Mega8 */
+#define OWN_DEVCODE		0x74				/* Mega644 */
+#define OWN_SIGNATURE		{ 0x1E, 0x96, 0x0A }		/* Mega644P */
+
+/* SLA+R */
 #define CMD_WAIT		0x00
-#define CMD_GET_INFO		0x10
-#define CMD_GET_SIGNATURE	0x11
-#define CMD_WRITE_FLASH		0x12
-#define CMD_READ_FLASH		0x13
-#define CMD_WRITE_EEPROM	0x14
-#define CMD_READ_EEPROM		0x15
-#define CMD_BOOT_APPLICATION	0x1F
+#define CMD_READ_VERSION	0x01
+#define CMD_READ_MEMORY		0x02
 
-#define CMD_SET_PWM		0x21
-#define CMD_GET_STATUS		0x22
-// #define CMD_SET_PARAM		0x23
-// #define CMD_GET_PARAM		0x24
-#define CMD_BOOT_LOADER		0x2F
+/* SLA+W */
+#define CMD_SWITCH_APPLICATION	CMD_READ_VERSION
+#define CMD_WRITE_MEMORY	CMD_READ_MEMORY
 
-#define DEVCODE_M8	0x77
-#define DEVCODE_M644	0x74
+/* CMD_SWITCH_APPLICATION parameter */
+#define BOOTTYPE_BOOTLOADER	0x00
+#define BOOTTYPE_APPLICATION	0x80
+
+/* CMD_{READ|WRITE}_* parameter */
+#define MEMTYPE_CHIPINFO	0x00
+#define MEMTYPE_FLASH		0x01
+#define MEMTYPE_EEPROM		0x02
+#define MEMTYPE_PARAMETERS	0x03
+
 
 static void sendchar(uint8_t data)
 {
@@ -68,15 +79,14 @@ static uint8_t recvchar(void)
 	return UDR0;
 }
 
-static int uart_putchar(char c, FILE *stream)
+static void print_byte(uint8_t val)
 {
-	if (c == '\n')
-		uart_putchar('\r', stream);
-	sendchar(c);
-	return 0;
-}
+	uint8_t tmp = (val >> 4) & 0x0F;
+	sendchar((tmp < 0x0A) ? ('0' + tmp) : ('a' - 0x0A + tmp));
 
-static FILE mystdout = FDEV_SETUP_STREAM(uart_putchar, NULL, _FDEV_SETUP_WRITE);
+	tmp = val & 0x0F;
+	sendchar((tmp < 0x0A) ? ('0' + tmp) : ('a' - 0x0A + tmp));
+}
 
 static uint8_t i2c_master_tx(uint8_t val)
 {
@@ -104,14 +114,14 @@ static uint8_t i2c_master_rx(uint8_t *val, uint8_t ack)
 
 static void i2c_stop(void)
 {
-	PORTB &= ~LED_RT;
+	PORTB |= LED_RT;
 	TWCR = (1<<TWINT) | (1<<TWSTO) | (1<<TWEN);
 }
 
 static void i2c_start_address(uint8_t addr)
 {
 	while (1) {
-		PORTB |= LED_RT;
+		PORTB &= ~LED_RT;
 		TWCR = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN);
 		loop_until_bit_is_set(TWCR, TWINT);
 
@@ -125,7 +135,7 @@ static void i2c_start_address(uint8_t addr)
 }
 
 /* wait 100x 10ms */
-static uint8_t boot_timeout = 100;
+volatile static uint8_t boot_timeout = 100;
 
 ISR(TIMER0_OVF_vect)
 {
@@ -145,7 +155,9 @@ ISR(TIMER0_OVF_vect)
 }
 
 static uint16_t address;
-static uint8_t page_buf[256];
+static uint16_t page_size;
+static uint8_t page_buf[SPM_PAGESIZE];
+
 
 static void eraseFlash(void)
 {
@@ -237,6 +249,9 @@ static uint16_t readEEpromPage(uint16_t address, uint16_t size)
 	return address;
 }
 
+/* 0-2: signature, 3: pagesize, 4-5: flash size, 6-7: eeprom size */
+static uint8_t chipinfo[8];
+
 void cmd_loop(void)
 {
 	uint8_t i2c_dev = 0;
@@ -258,14 +273,15 @@ void cmd_loop(void)
 		// write address
         	} else if (val == 'A') {
 			address = recvchar();
-			address = (address<<8) | recvchar();
+			address = (address << 8) | recvchar();
 			sendchar('\r');
 
 		// Buffer load support
 		} else if (val == 'b') {
 			sendchar('Y');
-			sendchar((sizeof(page_buf) >> 8) & 0xFF);
-			sendchar(sizeof(page_buf) & 0xFF);
+			page_size = (i2c_dev == 0) ? sizeof(page_buf) : chipinfo[3];
+			sendchar((page_size >> 8) & 0xFF);
+			sendchar(page_size & 0xFF);
 
 		// Start buffer load
 		} else if (val == 'B') {
@@ -277,27 +293,17 @@ void cmd_loop(void)
 			size |= recvchar();
 			val = recvchar();
 
-			for (cnt = 0; cnt < sizeof(page_buf); cnt++)
+			for (cnt = 0; cnt < page_size; cnt++)
 				*tmp++ = (cnt < size) ? recvchar() : 0xFF;
 
 			if (i2c_dev != 0) {
 				i2c_start_address(i2c_dev);
-				if (val == 'F') {
-					i2c_master_tx(CMD_WRITE_FLASH);
-					// FIXME: Flashwriting is not working. see bl_master (which works)
-
-				} else {
-					i2c_master_tx(CMD_WRITE_EEPROM);
-					/* no page align, transfer only needed bytes */
-					cnt = size;
-				}
-
+				i2c_master_tx(CMD_WRITE_MEMORY);
+				i2c_master_tx((val == 'F') ? MEMTYPE_FLASH : MEMTYPE_EEPROM);
 				i2c_master_tx(address >> 8);
 				i2c_master_tx(address & 0xFF);
-				address += sizeof(page_buf);
 
-				i2c_master_tx(WRITE_COOKIE >> 8);
-				i2c_master_tx(WRITE_COOKIE & 0xFF);
+				address += page_size;
 
 				tmp = page_buf;
 				while (cnt--)
@@ -322,11 +328,8 @@ void cmd_loop(void)
 
 			if (i2c_dev != 0) {
 				i2c_start_address(i2c_dev);
-				if (val == 'F')
-					i2c_master_tx(CMD_READ_FLASH);
-				else
-					i2c_master_tx(CMD_READ_EEPROM);
-
+				i2c_master_tx(CMD_READ_MEMORY);
+				i2c_master_tx((val == 'F') ? MEMTYPE_FLASH : MEMTYPE_EEPROM);
 				i2c_master_tx(address >> 8);
 				i2c_master_tx(address & 0xFF);
 
@@ -363,18 +366,11 @@ void cmd_loop(void)
 		} else if (val == 'P') {
 			if (i2c_dev != 0) {
 				i2c_start_address(i2c_dev);
-				i2c_master_tx(CMD_BOOT_LOADER);
+				i2c_master_tx(CMD_SWITCH_APPLICATION);
+				i2c_master_tx(BOOTTYPE_BOOTLOADER);
 				i2c_stop();
 
 				_delay_ms(10);
-
-				i2c_start_address(i2c_dev);
-				i2c_master_tx(CMD_GET_SIGNATURE);
-				i2c_start_address(i2c_dev | 0x01);
-				i2c_master_rx(&val, 1);
-				i2c_master_rx(&val, 1);
-				i2c_master_rx(&val, 0);
-				i2c_stop();
 			}
 			sendchar('\r');
 
@@ -382,7 +378,8 @@ void cmd_loop(void)
 		} else if (val == 'L') {
 			if (i2c_dev != 0) {
 				i2c_start_address(i2c_dev);
-				i2c_master_tx(CMD_BOOT_APPLICATION);
+				i2c_master_tx(CMD_SWITCH_APPLICATION);
+				i2c_master_tx(BOOTTYPE_APPLICATION);
 				i2c_stop();
 			}
 			sendchar('\r');
@@ -393,7 +390,7 @@ void cmd_loop(void)
 
 		// Return device type
 		} else if (val == 't') {
-			sendchar((i2c_dev == 0) ? DEVCODE_M644 : DEVCODE_M8);
+			sendchar((i2c_dev == 0) ? OWN_DEVCODE : TWI_DEVCODE);
 			sendchar(0);
 
 		// clear and set LED ignored
@@ -424,14 +421,15 @@ void cmd_loop(void)
 		// Return Signature Bytes
 		} else if (val == 's') {
 			if (i2c_dev != 0) {
-				sendchar(0x07);
-				sendchar(0x93);
-				sendchar(0x1e);
+				sendchar(chipinfo[2]);
+				sendchar(chipinfo[1]);
+				sendchar(chipinfo[0]);
 
 			} else {
-				sendchar(0x09);
-				sendchar(0x96);
-				sendchar(0x1e);
+				uint8_t sig[3] = OWN_SIGNATURE;
+				sendchar(sig[2]);
+				sendchar(sig[1]);
+				sendchar(sig[0]);
 			}
 
 		// set i2c target
@@ -440,27 +438,20 @@ void cmd_loop(void)
 			sendchar(val);
 
 		} else if (val >= '1' && val <= '4') {
-			i2c_dev = (val - '1' + 0x21) << 1;
+			i2c_dev = (val - '0' + TWI_ADDRESS_BASE) << 1;
 			sendchar(val);
+			sendchar('<');
 
-		// test props
-		} else if (val == 'l') {
 			i2c_start_address(i2c_dev);
-			i2c_master_tx(CMD_SET_PWM);
-			i2c_master_tx(0x00);
+			i2c_master_tx(CMD_SWITCH_APPLICATION);
+			i2c_master_tx(BOOTTYPE_BOOTLOADER);
 			i2c_stop();
 
-		// test props
-		} else if (val == 'k') {
-			i2c_start_address(i2c_dev);
-			i2c_master_tx(CMD_SET_PWM);
-			i2c_master_tx(0x0f);
-			i2c_stop();
+			for (val = 0; val < 10; val++)
+				_delay_ms(10);
 
-		// get Info
-		} else if (val == 'I') {
 			i2c_start_address(i2c_dev);
-			i2c_master_tx(CMD_GET_INFO);
+			i2c_master_tx(CMD_READ_VERSION);
 			i2c_start_address(i2c_dev | 0x01);
 
 			uint8_t cnt;
@@ -471,6 +462,62 @@ void cmd_loop(void)
 
 			i2c_stop();
 
+			sendchar(',');
+
+			i2c_start_address(i2c_dev);
+			i2c_master_tx(CMD_READ_MEMORY);
+			i2c_master_tx(MEMTYPE_CHIPINFO);
+			i2c_master_tx(0x00);
+			i2c_master_tx(0x00);
+			i2c_start_address(i2c_dev | 0x01);
+
+			uint8_t i;
+			for (i = 0; i < sizeof(chipinfo); i++) {
+				uint8_t more = (i < (sizeof(chipinfo) -1));
+				i2c_master_rx(&chipinfo[i], more);
+
+				sendchar('0');
+				sendchar('x');
+				print_byte(chipinfo[i]);
+				sendchar(more ? ',' : '>');
+			}
+			i2c_stop();
+
+		// test props
+		} else if (val == 'k' || val == 'l') {
+			if (i2c_dev != 0) {
+				i2c_start_address(i2c_dev);
+				i2c_master_tx(0x00 + (val - 'k') * 0x10);
+				i2c_stop();
+
+				sendchar(val);
+			}
+
+		// start Application / get Version
+		} else if (val == 'I') {
+			if (i2c_dev != 0) {
+				i2c_start_address(i2c_dev);
+				i2c_master_tx(CMD_SWITCH_APPLICATION);
+				i2c_master_tx(BOOTTYPE_APPLICATION);
+				i2c_stop();
+
+				for (val = 0; val < 10; val++)
+					_delay_ms(10);
+
+				i2c_start_address(i2c_dev);
+				i2c_master_tx(CMD_READ_VERSION);
+				i2c_start_address(i2c_dev | 0x01);
+
+				sendchar('<');
+				uint8_t cnt;
+				for (cnt = 0; cnt < 16; cnt++) {
+					i2c_master_rx(&val, (cnt != 15));
+					sendchar(val);
+				}
+				sendchar('>');
+				i2c_stop();
+			}
+
 		/* ESC */
 		} else if (val != 0x1b) {
 			sendchar('?');
@@ -478,12 +525,28 @@ void cmd_loop(void)
 	}
 }
 
-static void (*jump_to_app)(void) = 0x0000;
+static void (*jump_to_app)(void) __attribute__ ((noreturn)) = 0x0000;
 
+/*
+ * For newer devices the watchdog timer remains active even after a
+ * system reset. So disable it as soon as possible.
+ * automagically called on startup
+ */
+#if defined (__AVR_ATmega88__) || defined (__AVR_ATmega168__)
+void disable_wdt_timer(void) __attribute__((naked, section(".init3")));
+void disable_wdt_timer(void)
+{
+	MCUSR = 0;
+	WDTCSR = (1<<WDCE) | (1<<WDE);
+	WDTCSR = (0<<WDE);
+}
+#endif
+
+int main(void) __attribute__ ((noreturn));
 int main(void)
 {
 	DDRB = LED_GN | LED_RT;
-	PORTB = LED_GN;
+	PORTB = LED_GN | LED_RT;
 
 	/* move interrupt-vectors to bootloader */
 	MCUCR = (1<<IVCE);
@@ -496,8 +559,6 @@ int main(void)
 	/* USART: rx/tx enable, 8n1 */
 	UCSR0B = (1<<TXEN0) | (1<<RXEN0);
 	UCSR0C = (1<<UCSZ01) | (1<<UCSZ00);
-
-	stdout = &mystdout;
 
 	/* timer0: running with F_CPU/1024 */
 	TCCR0B = (1<<CS02) | (1<<CS00);
@@ -523,7 +584,11 @@ int main(void)
 	MCUCR = (1<<IVCE);
 	MCUCR = (0<<IVSEL);
 
-	jump_to_app();
+	PORTB = LED_RT;
 
-	return 0;
+	uint8_t i;
+	for (i = 0; i < 10; i++)
+		_delay_ms(10);
+
+	jump_to_app();
 }
