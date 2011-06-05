@@ -120,28 +120,27 @@ static void i2c_start_address(uint8_t addr)
 	}
 }
 
-static void i2c_switch_app(uint8_t i2c_dev, uint8_t app)
+static void i2c_switch_app(uint8_t i2c_dev, uint8_t app, uint8_t show_version)
 {
 	i2c_start_address(i2c_dev);
 	i2c_master_tx(CMD_SWITCH_APPLICATION);
 	i2c_master_tx(app);
 	i2c_stop();
 
-	_delay_ms(20);
-}
+	_delay_ms(100);
 
-static void i2c_print_version(uint8_t i2c_dev)
-{
-	i2c_start_address(i2c_dev);
-	i2c_master_tx(CMD_READ_VERSION);
-	i2c_start_address(i2c_dev | 0x01);
+	if (show_version) {
+		i2c_start_address(i2c_dev);
+		i2c_master_tx(CMD_READ_VERSION);
+		i2c_start_address(i2c_dev | 0x01);
 
-	uint8_t cnt = 16;
-	while (cnt--) {
-		sendchar(i2c_master_rx(cnt));
+		uint8_t cnt = 16;
+		while (cnt--) {
+			sendchar(i2c_master_rx(cnt));
+		}
+
+		i2c_stop();
 	}
-
-	i2c_stop();
 }
 
 static uint8_t page_buf[SPM_PAGESIZE];
@@ -149,7 +148,7 @@ static uint8_t page_buf[SPM_PAGESIZE];
 static void eraseFlash(void)
 {
 	uint16_t address = 0;
-	while (APP_END < address) {
+	while (APP_END > address) {
 		boot_page_erase(address);
 		boot_spm_busy_wait();
 		address += SPM_PAGESIZE;
@@ -280,9 +279,9 @@ void cmd_loop(uint8_t val)
 				i2c_stop();
 
 			} else {
-				if (val == 'F') {
+				if (val == 'F' && address < APP_END) {
 					writeFlashPage(address, size);
-				} else if (val == 'E') {
+				} else if (val == 'E' && address < E2END) {
 					writeEEpromPage(address, size);
 				}
 				address += size;
@@ -337,7 +336,7 @@ void cmd_loop(uint8_t val)
 		} else if (val == 'P' || val == 'L') {
 			if (i2c_dev != 0) {
 				val = (val == 'P') ? BOOTTYPE_BOOTLOADER : BOOTTYPE_APPLICATION;
-				i2c_switch_app(i2c_dev, val);
+				i2c_switch_app(i2c_dev, val, 0);
 			}
 			response = '\r';
 
@@ -391,9 +390,7 @@ void cmd_loop(uint8_t val)
 		} else if (val >= '1' && val <= '4') {
 			i2c_dev = (val - '0' + TWI_ADDRESS_BASE) << 1;
 
-			i2c_switch_app(i2c_dev, BOOTTYPE_BOOTLOADER);
-			_delay_ms(100);
-			i2c_print_version(i2c_dev);
+			i2c_switch_app(i2c_dev, BOOTTYPE_BOOTLOADER, 1);
 
 			i2c_start_address(i2c_dev);
 			i2c_master_tx(CMD_READ_MEMORY);
@@ -421,9 +418,7 @@ void cmd_loop(uint8_t val)
 		// get Version
 		} else if (val == 'I') {
 			if (i2c_dev != 0) {
-				i2c_switch_app(i2c_dev, BOOTTYPE_APPLICATION);
-				_delay_ms(100);
-				i2c_print_version(i2c_dev);
+				i2c_switch_app(i2c_dev, BOOTTYPE_APPLICATION, 1);
 			}
 
 		// fake MK-TOOL specific stuff
