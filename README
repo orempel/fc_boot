@@ -1,0 +1,25 @@
+1) Flash FC firmware:
+# reset running firmware (MCU will execute bootloader only for ~1s!)
+$ echo -e -n "#aR@S\r" > /dev/ttyUSB1
+
+# flash new firmware
+$ avrdude -p m644p -c butterfly -b 57600 -P /dev/ttyUSB1 -U flash:w:/tmp/Flight-Ctrl_MEGA644_V0_82a.hex
+
+
+2) Flash BLMC firmware (via twiboot):
+# enter bootloader (0x1B, 'S'), select first twi-slave ('1'):
+$ echo -e -n "\x1BS1" > /dev/ttyUSB1
+
+# flash new firmware
+$ avrdude -p m8 -c butterfly -b 57600 -P /dev/ttyUSB1 -U flash:w:/tmp/blmc.hex
+
+# select next twi-slave (bootloader is still active)
+$ echo -e -n "2" > /dev/ttyUSB1
+
+
+3) Other Commands:
+'0'       => select FC internal flash/eeprom
+'1' - '4' => select twi-slave 1-4, print bootloader version
+'I'       => start application on selected twi-slave, print application version
+'l'       => start selected motor
+'k'       => stop selected motor
