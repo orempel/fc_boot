@@ -1,54 +1,68 @@
-PRG            = fc_boot
-OBJ            = main.o
-MCU_TARGET     = atmega644p
-OPTIMIZE       = -Os
+CC	:= avr-gcc
+LD	:= avr-ld
+OBJCOPY	:= avr-objcopy
+OBJDUMP	:= avr-objdump
+SIZE	:= avr-size
 
-DEFS           =
-LIBS           =
+TARGET = fc_boot
+SOURCE = $(wildcard *.c)
 
-LDSCRIPT_SRC  := /usr/lib/ldscripts/avr5.x
-LDSCRIPT_DST  := ldscript-no-vectors.x
+# select MCU
+MCU = atmega644p
 
-# Override is only needed by avr-lib build system.
-override CFLAGS        = -g -Wall $(OPTIMIZE) -mmcu=$(MCU_TARGET) $(DEFS)
-override LDFLAGS       = -Wl,-Map,$(PRG).map,--section-start=.text=0xF800,-T$(LDSCRIPT_DST)
+AVRDUDE_PROG := -c avr910 -b 115200 -P /dev/ttyUSB0
+#AVRDUDE_PROG := -c dragon_isp -P usb
 
-CC             = avr-gcc
-OBJCOPY        = avr-objcopy
-OBJDUMP        = avr-objdump
-SIZE           = avr-size
+# ---------------------------------------------------------------------------
 
-#LDSCRIPT_SRC  := $(shell LANG=C $(CC) $(CFLAGS) -Wl,--verbose 2> /dev/null | awk '/^opened script file (.*)$$/{ print $$4 }')
+ifeq ($(MCU), atmega644p)
+AVRDUDE_MCU=m644p
 
-all: $(PRG).elf lst text
-	$(SIZE) -x -A $(PRG).elf
+# (20MHz ext. Crystal, 2.7V BOD)
+AVRDUDE_FUSES=lfuse:w:0xff:m hfuse:w:0xdc:m efuse:w:0xfd:m
+BOOTLOADER_START=0xF800
+endif
 
-$(PRG).elf: $(OBJ) | $(LDSCRIPT_DST)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
+# ---------------------------------------------------------------------------
 
-$(LDSCRIPT_DST): $(LDSCRIPT_SRC)
-# remove all lines with *vectors* and insert DISCARD line above .text declaration
-	sed -e '/.*vectors.*/d' -e 's/\(^[ \t]*\)\(.text[ \t]*\:\)$$/\1\/DISCARD\/ : { *(.vectors) }\n\1\2/g' $^ > $@
-#	-diff -uNr $^ $@ > $@.diff
+CFLAGS = -pipe -g -Os -mmcu=$(MCU) -Wall
+CFLAGS += -fdata-sections -ffunction-sections
+CFLAGS += -Wa,-adhlns=$(*F).lst
+CFLAGS += -DBOOTLOADER_START=$(BOOTLOADER_START)
+LDFLAGS = -Wl,-Map,$(@:.elf=.map),--cref,--section-start=.text=$(BOOTLOADER_START)
+LDFLAGS += -Wl,--relax,--gc-sections
+
+LDSCRIPT := $(shell LANG=C $(CC) $(CFLAGS) -Wl,--verbose 2> /dev/null | awk '/^opened script file (.*)$$/{ print $$4 }')
+LDSCRIPT_NOVECT := ldscript-no-vectors-$(notdir $(LDSCRIPT))
+
+# ---------------------------------------------------------------------------
+
+$(TARGET): $(TARGET).elf
+	@$(SIZE) -B -x --mcu=$(MCU) $<
+
+$(TARGET).elf: $(SOURCE:.c=.o) | $(LDSCRIPT_NOVECT)
+	@echo " Linking file:  $@"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -Wl,-T$(LDSCRIPT_NOVECT) -o $@ $^ 2> /dev/null
+	@$(OBJDUMP) -h -S $@ > $(@:.elf=.lss)
+	@$(OBJCOPY) -j .text -j .data -O ihex $@ $(@:.elf=.hex)
+	@$(OBJCOPY) -j .text -j .data -O binary $@ $(@:.elf=.bin)
+
+%.o: %.c $(MAKEFILE_LIST)
+	@echo " Building file: $<"
+	@$(CC) $(CFLAGS) -o $@ -c $<
+
+# remove interrupt vector section from avr-libc linker script
+# (remove all lines with *vectors* and insert DISCARD line above .text declaration)
+$(LDSCRIPT_NOVECT): $(LDSCRIPT) $(MAKEFILE_LIST)
+	@echo " Creating:      $@"
+	@sed -e '/.*vectors.*/d' -e 's/\(^[ \t]*\)\(.text[ \t]*\:\)$$/\1\/DISCARD\/ : { *(.vectors) }\n\1\2/g' $< > $@
+#	-@diff -uNr $< $@ > $@.diff
 
 clean:
-	rm -rf *.o $(PRG).lst $(PRG).map $(PRG).elf $(PRG).hex $(PRG).bin $(LDSCRIPT_DST)
+	rm -rf $(SOURCE:.c=.o) $(SOURCE:.c=.lst) $(addprefix $(TARGET), .elf .map .lss .hex .bin) $(LDSCRIPT_NOVECT)
 
-lst:  $(PRG).lst
+install: $(TARGET).elf
+	avrdude $(AVRDUDE_PROG) -p $(AVRDUDE_MCU) -U flash:w:$(<:.elf=.hex)
 
-%.lst: %.elf
-	$(OBJDUMP) -h -S $< > $@
-
-text: hex bin
-
-hex:  $(PRG).hex
-bin:  $(PRG).bin
-
-%.hex: %.elf
-	$(OBJCOPY) -j .text -j .data -O ihex $< $@
-
-%.bin: %.elf
-	$(OBJCOPY) -j .text -j .data -O binary $< $@
-
-install: text
-	avrdude -c dragon_isp -P usb -p m644p -V -U flash:w:$(PRG).hex
+fuses:
+	avrdude $(AVRDUDE_PROG) -p $(AVRDUDE_MCU) $(patsubst %,-U %, $(AVRDUDE_FUSES))

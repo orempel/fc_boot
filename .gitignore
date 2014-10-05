@@ -3,5 +3,6 @@
 *.bin
 *.hex
 *.lst
+*.lss
 *.map
-ldscript-no-vectors.x
+ldscript-no-vectors-*.x
